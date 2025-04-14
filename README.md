@@ -1,4 +1,4 @@
-# MPI-CUDA-LageScaleKNN
+# MPI-CUDA-LargeScaleKNN
 MPI- and CUDA-accelerated kNN queries for large data sets
 
 # Dependencies:
