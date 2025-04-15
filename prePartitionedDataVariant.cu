@@ -120,7 +120,7 @@ std::vector<std::string> readListOfFileNames(std::string nameOfFileWithInFileNam
     std::getline(in,line);
     if (!in.good()) break;
 
-    names.push_back(line.substr(line.find('\n')));
+    names.push_back(line.substr(0,line.find('\n')));
   }
   return names;
 }
@@ -279,7 +279,7 @@ int main(int ac, char **av)
   CUKD_CUDA_CALL(Malloc((void **)&d_queries,numPointsThatIHave*sizeof(float3)));
   CUKD_CUDA_CALL(Memcpy(d_queries,myPoints.data(),numPointsThatIHave*sizeof(float3),
                         cudaMemcpyDefault));
-  CUKD_CUDA_CALL(Malloc((void **)&d_cand,N*numPointsThatIHave*sizeof(uint64_t)));
+  CUKD_CUDA_CALL(Malloc((void **)&d_cand,k*numPointsThatIHave*sizeof(uint64_t)));
 
   // -----------------------------------------------------------------------------
   // initialize algorithm for compuing per-rank send/recv peers
@@ -302,6 +302,8 @@ int main(int ac, char **av)
   // now, do the queries and cycling:
   // -----------------------------------------------------------------------------
   for (int round=0;round<mpi.size;round++) {
+    CUKD_MPI_CALL(Barrier(mpi.comm));
+    if (mpi.rank == 0) std::cout << "round " << round << std::endl;
     if (round == 0) {
       CUKD_CUDA_CALL(Memcpy(d_work_tree,d_my_tree,
                             numPointsThatIHave*sizeof(myPoints[0]),
@@ -361,6 +363,20 @@ int main(int ac, char **av)
     (d_finalResults,numQueries,k,d_cand);
   CUKD_CUDA_CALL(DeviceSynchronize());
 
+#if 0
+  // output for probed verification
+  for (int r=0;r<mpi.size;r++) {
+    MPI_Barrier(mpi.comm);
+    if (r == mpi.rank)
+    for (int i=0;i<myPoints.size();i++) {
+      int gid = 960000/12*mpi.rank+i;
+      if ((gid % 16*1024) == 0)
+        printf("RES %012i = %f\n",gid,d_finalResults[i]);
+    }
+    MPI_Barrier(mpi.comm);
+  }
+#endif
+  
   {
     char suffix[100];
     sprintf(suffix,"_%06d.float",mpi.rank);

@@ -212,6 +212,20 @@ int main(int ac, char **av)
 
   MPI_Barrier(mpi.comm);
 
+#if 0
+  // output for probed verification
+  for (int r=0;r<mpi.size;r++) {
+    MPI_Barrier(mpi.comm);
+    if (r == mpi.rank)
+    for (int i=0;i<myPoints.size();i++) {
+      int gid = begin+i;
+      if ((gid % 16*1024) == 0)
+        printf("RES %012i = %f\n",gid,d_finalResults[i]);
+    }
+    MPI_Barrier(mpi.comm);
+  }
+#endif
+  
   for (int i=0;i<mpi.size;i++) {
     MPI_Barrier(mpi.comm);
     if (i == mpi.rank) {
