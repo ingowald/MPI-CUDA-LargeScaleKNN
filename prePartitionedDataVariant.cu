@@ -1,8 +1,28 @@
+// ======================================================================== //
+// Copyright 2025-2025 Ingo Wald                                            //
+//                                                                          //
+// Licensed under the Apache License, Version 2.0 (the "License");          //
+// you may not use this fle except in compliance with the License.         //
+// You may obtain a copy of the License at                                  //
+//                                                                          //
+//     http://www.apache.org/licenses/LICENSE-2.0                           //
+//                                                                          //
+// Unless required by applicable law or agreed to in writing, software      //
+// distributed under the License is distributed on an "AS IS" BASIS,        //
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. //
+// See the License for the specific language governing permissions and      //
+// limitations under the License.                                           //
+// ======================================================================== //
+
 #include "cukd/cukd-math.h"
 #include "cukd/traverse-stack-free.h"
 #include "cukd/knn.h"
+#include "cukd/box.h"
 #include <mpi.h>
 #include <stdexcept>
+#include <random>
+
+using namespace cukd;
 
 #define CUKD_MPI_CALL(fctCall)                                          \
   { int rc = MPI_##fctCall;                                             \
@@ -46,7 +66,6 @@ std::vector<T> readFilePortion(std::string inFileName,
   return result;
 }
 
-
 void usage(const std::string &error)
 {
   std::cerr << "Error: " << error << std::endl << std::endl;
@@ -54,13 +73,13 @@ void usage(const std::string &error)
   exit(error.empty()?0:1);
 }
 
-
-
 __global__ void runQuery(float3 *tree, int N,
                          uint64_t *candidateLists, int k, float maxRadius,
                          float3 *queries, int numQueries,
+                         float *pMaxRadius,
                          int round)
 {
+#ifdef __CUDA_ARCH__
   int tid = threadIdx.x+blockIdx.x*blockDim.x;
   if (tid >= numQueries) return;
 
@@ -68,6 +87,12 @@ __global__ void runQuery(float3 *tree, int N,
   cukd::FlexHeapCandidateList cl(candidateLists+k*tid,k,
                                  round == 0 ? maxRadius : -1.f);
   cukd::stackFree::knn(cl,qp,tree,N);
+
+  float myRadius = sqrtf(cl.maxRadius2());
+  if (myRadius > *pMaxRadius)
+    // ::atomicMax((int*)pMaxRadius,(int &)myRadius);
+    cukd::atomicMax(pMaxRadius,myRadius);
+#endif
 }
 
 __global__ void extractFinalResult(float *d_finalResults,
@@ -85,22 +110,84 @@ __global__ void extractFinalResult(float *d_finalResults,
 
   d_finalResults[tid] = result;
  }
-  
+
+std::vector<std::string> readListOfFileNames(std::string nameOfFileWithInFileNames)
+{
+  std::vector<std::string> names;
+  std::ifstream in(nameOfFileWithInFileNames);
+  while (in) {
+    std::string line;
+    std::getline(in,line);
+    if (!in.good()) break;
+
+    names.push_back(line.substr(line.find('\n')));
+  }
+  return names;
+}
+
+typedef cukd::box_t<float3> box3f;
+
+bool allNegativeOnes(const std::vector<int> &vec)
+{
+  for (auto v : vec) if (v != -1) return false;
+  return true;
+}
+
+std::vector<int> computePermutation(int rank, int size)
+{
+  std::srand(rank+0x1234567);
+  for (int i=0;i<10;i++)
+    std::rand();
+  std::vector<int> ret(size);
+  for (int i=0;i<size;i++) ret[i] = i;
+  for (int i=size-1;i>0;--i) {
+    int other = std::rand() % i;
+    std::swap(ret[other],ret[i]);
+  }
+  return ret;
+}
+
+float computeDistance(const box3f &a,
+                      const box3f &b)
+{
+  float3 diff = max(make_float3(0.f,0.f,0.f),max(a.lower-b.upper,b.lower-a.upper));
+  return sqrtf(diff.x*diff.x+diff.y*diff.y+diff.z*diff.z);
+}
+
+int computeMyPeer(const box3f &myBounds,
+                  const std::vector<box3f> &allBounds,
+                  float cutOffRadius,
+                  std::vector<bool> &alreadySeen,
+                  const std::vector<int> &permutation)
+{
+  int best = -1;
+  float closest = INFINITY;
+  for (auto peer : permutation) {
+    if (alreadySeen[peer]) continue;
+    float dist = computeDistance(myBounds,allBounds[peer]);
+    if (dist >= cutOffRadius) continue;
+    if (dist >= closest) continue;
+    closest = dist;
+    best = peer;
+  }
+  return best;
+}
+
 int main(int ac, char **av)
 {
   MPI_Init(&ac,&av);
   float maxRadius = std::numeric_limits<float>::infinity();
   int   k = 0;
   int   gpuAffinityCount = 0;
-  std::string inFileName;
-  std::string outFileName;
+  std::string nameOfFileWithInFileNames;
+  std::string outFilePrefix;
 
   for (int i=1;i<ac;i++) {
     const std::string arg = av[i];
     if (arg == "-o")
-      outFileName = av[++i];
+      outFilePrefix = av[++i];
     else if (arg[0] != '-')
-      inFileName = arg;
+      nameOfFileWithInFileNames = arg;
     else if (arg == "-r")
       maxRadius = std::atof(av[++i]);
     else if (arg == "-g")
@@ -110,25 +197,23 @@ int main(int ac, char **av)
     else
       usage("unknown cmdline arg '"+arg+"'");
   }
-
-  if (inFileName.empty())
-    usage("no input file name specified");
-  if (outFileName.empty())
-    usage("no output file name specified");
+  
+  if (nameOfFileWithInFileNames.empty())
+    usage("no input file name specified (should be a text file with list of input files)");
+  if (outFilePrefix.empty())
+    usage("no output file(s) prefix specified");
   if (k < 1)
     usage("no k specified, or invalid k value");
+  
+  std::vector<std::string> inFileNames
+    = readListOfFileNames(nameOfFileWithInFileNames);
 
+  // -----------------------------------------------------------------------------
+  // init mpi, check valid mpi size, and affinitize gpu (if desired)
+  // -----------------------------------------------------------------------------
   MPIComm mpi(MPI_COMM_WORLD);
-
-  size_t begin = 0;
-  size_t numPointsTotal = 0;
-  std::vector<float3> myPoints
-    = readFilePortion<float3>(inFileName,mpi.rank,mpi.size,&begin,&numPointsTotal);
-  std::cout << "#" << mpi.rank << "/" << mpi.size
-            << ": got " << myPoints.size() << " points to work on"
-            << std::endl;
-
-
+  if (mpi.size != inFileNames.size())
+    throw std::runtime_error("number of input files does not match MPI size");
   if (gpuAffinityCount) {
     int deviceID = mpi.rank % gpuAffinityCount;
     std::cout << "#" << mpi.rank << "/" << mpi.size
@@ -137,58 +222,138 @@ int main(int ac, char **av)
     CUKD_CUDA_CALL(SetDevice(deviceID));
   }
 
-  float3 *d_tree = 0;
-  float3 *d_tree_recv = 0;
-  int N = myPoints.size();
-  // alloc N+1 so we can store one more if anytoher rank gets oen more point
-  CUKD_CUDA_CALL(Malloc((void **)&d_tree,(N+1)*sizeof(myPoints[0])));
-  CUKD_CUDA_CALL(Malloc((void **)&d_tree_recv,(N+1)*sizeof(myPoints[0])));
-  CUKD_CUDA_CALL(Memcpy(d_tree,myPoints.data(),N*sizeof(myPoints[0]),
-                        cudaMemcpyDefault));
-  cukd::buildTree(d_tree,N);
+  // -----------------------------------------------------------------------------
+  // read our points (on host), and compute bounding box
+  // -----------------------------------------------------------------------------
+  std::vector<float3> myPoints
+    = readFilePortion<float3>(inFileNames[mpi.rank],0,1);
+  box3f myBounds; myBounds.setEmpty();
+  for (auto point : myPoints)
+    myBounds.grow(point);
+  {
+    std::stringstream ss;
+    ss << "#" << mpi.rank << "/" << mpi.size
+       << ": got " << myPoints.size() << " points to work on, bounds is "
+       << "("
+       << myBounds.lower.x << ","
+       << myBounds.lower.y << ","
+       << myBounds.lower.z << ")-("
+       << myBounds.upper.x << ","
+       << myBounds.upper.y << ","
+       << myBounds.upper.z << ")" 
+       << std::endl;
+    std::cout << ss.str();
+  }
 
+  // -----------------------------------------------------------------------------
+  // find out max num points anybody has, so we can allocate
+  // -----------------------------------------------------------------------------
+  int numPointsThatIHave = myPoints.size();
+  int maxNumPointsAnybodyHas = 0;
+  
+  CUKD_MPI_CALL(Allreduce(&numPointsThatIHave,&maxNumPointsAnybodyHas,
+                          1,MPI_INT,MPI_MAX,mpi.comm));
+  
+  // -----------------------------------------------------------------------------
+  // allocate buffers (large enough to cycle), upload our data into
+  // first of them, and build tree
+  // -----------------------------------------------------------------------------
+  float3 *d_my_tree = 0;
+  float3 *d_work_tree = 0;
+  CUKD_CUDA_CALL(Malloc((void **)&d_my_tree,
+                        maxNumPointsAnybodyHas*sizeof(myPoints[0])));
+  CUKD_CUDA_CALL(Malloc((void **)&d_work_tree,
+                        maxNumPointsAnybodyHas*sizeof(myPoints[0])));
+  CUKD_CUDA_CALL(Memcpy(d_my_tree,myPoints.data(),
+                        numPointsThatIHave*sizeof(myPoints[0]),
+                        cudaMemcpyDefault));
+  int N = numPointsThatIHave;
+  cukd::buildTree(d_my_tree,N);
+
+  // -----------------------------------------------------------------------------
+  // upload our queries, and alloc candidate list(s)
+  // -----------------------------------------------------------------------------
   float3   *d_queries;
   int numQueries = myPoints.size();
   uint64_t *d_cand;
-  CUKD_CUDA_CALL(Malloc((void **)&d_queries,N*sizeof(float3)));
-  CUKD_CUDA_CALL(Malloc((void **)&d_cand,N*k*sizeof(uint64_t)));
+  CUKD_CUDA_CALL(Malloc((void **)&d_queries,numPointsThatIHave*sizeof(float3)));
+  CUKD_CUDA_CALL(Memcpy(d_queries,myPoints.data(),numPointsThatIHave*sizeof(float3),
+                        cudaMemcpyDefault));
+  CUKD_CUDA_CALL(Malloc((void **)&d_cand,N*numPointsThatIHave*sizeof(uint64_t)));
 
+  // -----------------------------------------------------------------------------
+  // initialize algorithm for compuing per-rank send/recv peers
+  // -----------------------------------------------------------------------------
+  std::vector<int> requestedByRank(mpi.size);
+  std::vector<bool> alreadySeen(mpi.size); // == all false
+  std::vector<box3f> allBounds(mpi.size);
+  CUKD_MPI_CALL(Allgather(&myBounds,6,MPI_FLOAT,
+                          allBounds.data(),6,MPI_FLOAT,mpi.comm));
+
+  std::vector<int> allCounts(mpi.size);
+  CUKD_MPI_CALL(Allgather(&numPointsThatIHave,1,MPI_INT,
+                          allCounts.data(),1,MPI_INT,mpi.comm));
+
+  float *d_maxRadius = 0;
+  CUKD_CUDA_CALL(MallocManaged((void **)&d_maxRadius,sizeof(float)));
+  std::vector<int> permutation = computePermutation(mpi.rank,mpi.size);
+  
   // -----------------------------------------------------------------------------
   // now, do the queries and cycling:
   // -----------------------------------------------------------------------------
   for (int round=0;round<mpi.size;round++) {
-    
     if (round == 0) {
-      // nothing to do , we already have our own tree
+      CUKD_CUDA_CALL(Memcpy(d_work_tree,d_my_tree,
+                            numPointsThatIHave*sizeof(myPoints[0]),
+                            cudaMemcpyDefault));
+      alreadySeen[mpi.rank] = 1;
+      N = numPointsThatIHave;
+      // nothing to do, we already have our own tree
     } else {
-      MPI_Request requests[2];
-      int sendCount = N;
-      int recvCount = 0;
-      int sendPeer = (mpi.rank+1)%mpi.size;
-      int recvPeer = (mpi.rank+mpi.size-1)%mpi.size;
-      CUKD_MPI_CALL(Irecv(&recvCount,1*sizeof(int),MPI_BYTE,recvPeer,0,
-                        mpi.comm,&requests[0]));
-      CUKD_MPI_CALL(Isend(&sendCount,1*sizeof(int),MPI_BYTE,sendPeer,0,
-                        mpi.comm,&requests[1]));
-      CUKD_MPI_CALL(Waitall(2,requests,MPI_STATUSES_IGNORE));
+      int myPeer = computeMyPeer(myBounds,allBounds,
+                                 *d_maxRadius,alreadySeen,
+                                 permutation);
+      CUKD_MPI_CALL(Allgather(&myPeer,1,MPI_INT,
+                              requestedByRank.data(),1,MPI_INT,mpi.comm));
+      if (allNegativeOnes(requestedByRank))
+        // we're ALL done!
+        break;
       
-      CUKD_MPI_CALL(Irecv(d_tree_recv,recvCount*sizeof(*d_tree),MPI_BYTE,recvPeer,0,
-                          mpi.comm,&requests[0]));
-      CUKD_MPI_CALL(Isend(d_tree,sendCount*sizeof(*d_tree),MPI_BYTE,sendPeer,0,
-                          mpi.comm,&requests[1]));
-      CUKD_MPI_CALL(Waitall(2,requests,MPI_STATUSES_IGNORE));
-      
-      N = recvCount;
-      std::swap(d_tree,d_tree_recv);
+      MPI_Request request;
+      std::vector<MPI_Request> allRequests;
+      if (myPeer == -1) {
+        // nothing to receive
+        N = 0;
+      } else {
+        N = allCounts[myPeer];
+        CUKD_MPI_CALL(Irecv(d_work_tree,N*sizeof(float3),MPI_BYTE,myPeer,0,
+                            mpi.comm,&request));
+        allRequests.push_back(request);
+        alreadySeen[myPeer] = 1;
+      }
+
+      for (int peer=0;peer<mpi.size;peer++) {
+        int peerRequest = requestedByRank[peer];
+        if (peerRequest != mpi.rank) continue;
+
+        CUKD_MPI_CALL(Isend(d_my_tree,numPointsThatIHave*sizeof(float3),MPI_BYTE,
+                            peer,0,mpi.comm,&request));
+        allRequests.push_back(request);
+      }
+      CUKD_MPI_CALL(Waitall(allRequests.size(),allRequests.data(),MPI_STATUSES_IGNORE));
     }
     // -----------------------------------------------------------------------------
-    runQuery<<<divRoundUp(numQueries,1024),1024>>>
-      (/* tree */d_tree,N,
-       /* query params */d_cand,k,maxRadius,
-       /* query points */d_queries,numQueries,
-       round);
+    if (N) {
+      *d_maxRadius = 0.f;
+      runQuery<<<divRoundUp(numQueries,1024),1024>>>
+        (/* tree */d_work_tree,N,
+         /* query params */d_cand,k,maxRadius,
+         /* query points */d_queries,numQueries,
+         d_maxRadius,round);
+    }
     CUKD_CUDA_CALL(DeviceSynchronize());
   }
+  
   std::cout << "done all queries..." << std::endl;
   float *d_finalResults = 0;
   CUKD_CUDA_CALL(MallocManaged((void **)&d_finalResults,myPoints.size()*sizeof(float)));
@@ -196,16 +361,13 @@ int main(int ac, char **av)
     (d_finalResults,numQueries,k,d_cand);
   CUKD_CUDA_CALL(DeviceSynchronize());
 
-  MPI_Barrier(mpi.comm);
-
-  for (int i=0;i<mpi.size;i++) {
-    MPI_Barrier(mpi.comm);
-    if (i == mpi.rank) {
-      FILE *file = fopen(outFileName.c_str(),i==0?"wb":"ab");
-      fwrite(d_finalResults,sizeof(float),numQueries,file);
-      fclose(file);
-    }
-    MPI_Barrier(mpi.comm);
+  {
+    char suffix[100];
+    sprintf(suffix,"_%06d.float",mpi.rank);
+    std::ofstream out(outFilePrefix+suffix,std::ios::binary);
+    out.write((const char *)d_finalResults,numQueries*sizeof(float));
   }
+  
+  MPI_Barrier(mpi.comm);
   MPI_Finalize();
 }
