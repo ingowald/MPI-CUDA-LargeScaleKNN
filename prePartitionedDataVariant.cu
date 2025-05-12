@@ -66,6 +66,59 @@ std::vector<T> readFilePortion(std::string inFileName,
   return result;
 }
 
+template<typename T>
+void readFileByName(
+             std::vector<T> &values,
+             std::string inFileName,
+             int rank, int size,
+             size_t *pBegin = 0,
+             size_t *pNumTotal = 0
+             )
+{
+  char temp[1024];
+  sprintf(temp, "_%05d.part", rank);
+  std::string full_filepath = inFileName + std::string(temp);
+
+  std::ifstream in(full_filepath, std::ios::binary);
+  if (!in) {
+    throw std::runtime_error("Failed to open file for reading: " + full_filepath);
+  }
+
+  // Read the size of the data vector
+  size_t dataSize;
+  in.read(reinterpret_cast<char*>(&dataSize), sizeof(dataSize));
+
+  std::cout << "#" << rank << "/" << size << ": " << "Data size: " << dataSize << std::endl;
+
+  // Read the size of the name string
+  size_t nameSize;
+  in.read(reinterpret_cast<char*>(&nameSize), sizeof(nameSize));
+
+  // Read the characters of the name string
+  std::string name;
+  name.resize(nameSize);
+  in.read(&name[0], nameSize);
+  std::cout << "#" << rank << "/" << size << ": " << "Name: " << name << std::endl;
+
+  // Read 
+  int num_comp = 0;
+  in.read(reinterpret_cast<char*>(&num_comp), sizeof(num_comp));
+
+  if (num_comp != 3) {
+    throw std::runtime_error("Invalid number of components (3 for Position): " + std::to_string(num_comp));
+  }
+
+  // Read the size of the values vector
+  size_t valuesSize;
+  in.read(reinterpret_cast<char*>(&valuesSize), sizeof(valuesSize));
+  std::cout << "#" << rank << "/" << size << ": " << "Position size: " << valuesSize / 3 << std::endl;
+
+  // Read the values
+  values.resize(valuesSize / 3);
+  in.read(reinterpret_cast<char*>(values.data()), valuesSize * sizeof(float));
+  in.close();
+}
+
 void usage(const std::string &error)
 {
   std::cerr << "Error: " << error << std::endl << std::endl;
@@ -205,15 +258,16 @@ int main(int ac, char **av)
   if (k < 1)
     usage("no k specified, or invalid k value");
   
-  std::vector<std::string> inFileNames
-    = readListOfFileNames(nameOfFileWithInFileNames);
+  // std::vector<std::string> inFileNames
+  //   = readListOfFileNames(nameOfFileWithInFileNames);
 
   // -----------------------------------------------------------------------------
   // init mpi, check valid mpi size, and affinitize gpu (if desired)
   // -----------------------------------------------------------------------------
   MPIComm mpi(MPI_COMM_WORLD);
-  if (mpi.size != inFileNames.size())
-    throw std::runtime_error("number of input files does not match MPI size");
+  // if (mpi.size != inFileNames.size())
+  //   throw std::runtime_error("number of input files does not match MPI size");
+
   if (gpuAffinityCount) {
     int deviceID = mpi.rank % gpuAffinityCount;
     std::cout << "#" << mpi.rank << "/" << mpi.size
@@ -225,8 +279,20 @@ int main(int ac, char **av)
   // -----------------------------------------------------------------------------
   // read our points (on host), and compute bounding box
   // -----------------------------------------------------------------------------
-  std::vector<float3> myPoints
-    = readFilePortion<float3>(inFileNames[mpi.rank],0,1);
+  double read_time = MPI_Wtime();
+
+  size_t begin = 0;
+  size_t numPointsTotal = 0;
+  std::vector<float3> myPoints;
+  //= readFilePortion<float3>(inFileNames[mpi.rank],0,1);
+  readFileByName<float3>(myPoints,nameOfFileWithInFileNames,mpi.rank,mpi.size,&begin,&numPointsTotal);
+
+  MPI_Barrier(mpi.comm);
+  if (mpi.rank == 0)
+      std::cout << "Elapsed read time: " << (MPI_Wtime() - read_time) << " seconds." << std::endl;
+
+  double bounds_time = MPI_Wtime();
+
   box3f myBounds; myBounds.setEmpty();
   for (auto point : myPoints)
     myBounds.grow(point);
@@ -245,19 +311,25 @@ int main(int ac, char **av)
     std::cout << ss.str();
   }
 
+  MPI_Barrier(mpi.comm);
+  if (mpi.rank == 0)
+      std::cout << "Elapsed bounds time: " << (MPI_Wtime() - bounds_time) << " seconds." << std::endl;
+
   // -----------------------------------------------------------------------------
   // find out max num points anybody has, so we can allocate
-  // -----------------------------------------------------------------------------
-  int numPointsThatIHave = myPoints.size();
-  int maxNumPointsAnybodyHas = 0;
+  // ----------------------------------------------------------------------------- 
+  size_t numPointsThatIHave = myPoints.size();
+  size_t maxNumPointsAnybodyHas = 0;
   
   CUKD_MPI_CALL(Allreduce(&numPointsThatIHave,&maxNumPointsAnybodyHas,
-                          1,MPI_INT,MPI_MAX,mpi.comm));
+                          1,MPI_LONG_LONG_INT,MPI_MAX,mpi.comm));
   
   // -----------------------------------------------------------------------------
   // allocate buffers (large enough to cycle), upload our data into
   // first of them, and build tree
   // -----------------------------------------------------------------------------
+  double alloc1_time = MPI_Wtime();
+
   float3 *d_my_tree = 0;
   float3 *d_work_tree = 0;
   CUKD_CUDA_CALL(Malloc((void **)&d_my_tree,
@@ -267,23 +339,47 @@ int main(int ac, char **av)
   CUKD_CUDA_CALL(Memcpy(d_my_tree,myPoints.data(),
                         numPointsThatIHave*sizeof(myPoints[0]),
                         cudaMemcpyDefault));
-  int N = numPointsThatIHave;
+  size_t N = numPointsThatIHave;
+
+  MPI_Barrier(mpi.comm);
+
+  if (mpi.rank == 0)
+      std::cout << "Elapsed alloc (buildTree) time: " << (MPI_Wtime() - alloc1_time) << " seconds." << std::endl;
+
+  // ---------------------------------------------------------------------------
+  // build the tree:
+  // ---------------------------------------------------------------------------
+  double build_time = MPI_Wtime();
+
   cukd::buildTree(d_my_tree,N);
+
+  MPI_Barrier(mpi.comm);
+
+  if (mpi.rank == 0)
+      std::cout << "Elapsed buildTree time: " << (MPI_Wtime() - build_time) << " seconds." << std::endl;
 
   // -----------------------------------------------------------------------------
   // upload our queries, and alloc candidate list(s)
   // -----------------------------------------------------------------------------
+  double alloc2_time = MPI_Wtime();
+
   float3   *d_queries;
-  int numQueries = myPoints.size();
+  size_t numQueries = myPoints.size();
   uint64_t *d_cand;
   CUKD_CUDA_CALL(Malloc((void **)&d_queries,numPointsThatIHave*sizeof(float3)));
   CUKD_CUDA_CALL(Memcpy(d_queries,myPoints.data(),numPointsThatIHave*sizeof(float3),
                         cudaMemcpyDefault));
   CUKD_CUDA_CALL(Malloc((void **)&d_cand,k*numPointsThatIHave*sizeof(uint64_t)));
 
+  MPI_Barrier(mpi.comm);
+
+  if (mpi.rank == 0)
+      std::cout << "Elapsed alloc (queries) time: " << (MPI_Wtime() - alloc2_time) << " seconds." << std::endl;
   // -----------------------------------------------------------------------------
   // initialize algorithm for compuing per-rank send/recv peers
   // -----------------------------------------------------------------------------
+  double perm_time = MPI_Wtime();
+
   std::vector<int> requestedByRank(mpi.size);
   std::vector<bool> alreadySeen(mpi.size); // == all false
   std::vector<box3f> allBounds(mpi.size);
@@ -297,10 +393,16 @@ int main(int ac, char **av)
   float *d_maxRadius = 0;
   CUKD_CUDA_CALL(MallocManaged((void **)&d_maxRadius,sizeof(float)));
   std::vector<int> permutation = computePermutation(mpi.rank,mpi.size);
-  
+
+  MPI_Barrier(mpi.comm);
+
+  if (mpi.rank == 0)
+      std::cout << "Elapsed computePermutation time: " << (MPI_Wtime() - perm_time) << " seconds." << std::endl;
   // -----------------------------------------------------------------------------
   // now, do the queries and cycling:
   // -----------------------------------------------------------------------------
+  double calc_time = MPI_Wtime();
+
   for (int round=0;round<mpi.size;round++) {
     CUKD_MPI_CALL(Barrier(mpi.comm));
     if (mpi.rank == 0) std::cout << "round " << round << std::endl;
@@ -347,7 +449,7 @@ int main(int ac, char **av)
     // -----------------------------------------------------------------------------
     if (N) {
       *d_maxRadius = 0.f;
-      runQuery<<<divRoundUp(numQueries,1024),1024>>>
+      runQuery<<<divRoundUp(numQueries,1024ULL),1024ULL>>>
         (/* tree */d_work_tree,N,
          /* query params */d_cand,k,maxRadius,
          /* query points */d_queries,numQueries,
@@ -356,12 +458,17 @@ int main(int ac, char **av)
     CUKD_CUDA_CALL(DeviceSynchronize());
   }
   
-  std::cout << "done all queries..." << std::endl;
+  //std::cout << "done all queries..." << std::endl;
   float *d_finalResults = 0;
   CUKD_CUDA_CALL(MallocManaged((void **)&d_finalResults,myPoints.size()*sizeof(float)));
-  extractFinalResult<<<divRoundUp(numQueries,1024),1024>>>
+  extractFinalResult<<<divRoundUp(numQueries,1024ULL),1024ULL>>>
     (d_finalResults,numQueries,k,d_cand);
   CUKD_CUDA_CALL(DeviceSynchronize());
+
+  MPI_Barrier(mpi.comm);
+
+  if (mpi.rank == 0)
+      std::cout << "Elapsed queries time: " << (MPI_Wtime() - calc_time) << " seconds." << std::endl;
 
 #if 0
   // output for probed verification
@@ -379,7 +486,8 @@ int main(int ac, char **av)
   
   {
     char suffix[100];
-    sprintf(suffix,"_%06d.float",mpi.rank);
+    sprintf(suffix,"_%05d.float",mpi.rank);
+    std::cout << "#" << mpi.rank << "/" << mpi.size << ": " << "Writing: " << outFilePrefix+suffix << std::endl;
     std::ofstream out(outFilePrefix+suffix,std::ios::binary);
     out.write((const char *)d_finalResults,numQueries*sizeof(float));
   }

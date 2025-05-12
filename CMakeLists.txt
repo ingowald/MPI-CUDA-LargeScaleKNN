@@ -50,10 +50,10 @@ add_subdirectory(submodules/cudaKDTree EXCLUDE_FROM_ALL)
 # ==================================================================
 # actual code
 # ==================================================================
-add_executable(cudaMpiKNN_unorderedData unorderedDataVariant.cu)
+add_executable(cudaMpiKNN_unorderedData unorderedDataVariant.cu ${MPI_CXX_HEADER_DIR} ${MPI_CXX_COMPILER_INCLUDE_DIRS})
 target_link_libraries(cudaMpiKNN_unorderedData PUBLIC cudaKDTree MPI::MPI_CXX)
 
-add_executable(cudaMpiKNN_prePartitionedData prePartitionedDataVariant.cu)
+add_executable(cudaMpiKNN_prePartitionedData prePartitionedDataVariant.cu ${MPI_CXX_HEADER_DIR} ${MPI_CXX_COMPILER_INCLUDE_DIRS})
 target_link_libraries(cudaMpiKNN_prePartitionedData PUBLIC cudaKDTree MPI::MPI_CXX)
 
 
